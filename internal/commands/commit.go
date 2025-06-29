@@ -103,12 +103,6 @@ func Commit(args []string) {
 		os.Exit(1)
 	}
 
-	// Clear index after successful commit
-	idx = index.NewIndex(repo.GitDir)
-	if err := idx.Save(); err != nil {
-		fmt.Printf("Warning: failed to clear index: %v\n", err)
-	}
-
 	fmt.Printf("[main %s] %s\n", commitHash[:7], message)
 	fmt.Printf(" %d files changed\n", len(indexEntries))
 }

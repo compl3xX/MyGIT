@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"mygit/internal/index"
 	"mygit/internal/objects"
+	"mygit/internal/refs"
 	"mygit/internal/repository"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 func Status(args []string) {
@@ -32,23 +34,64 @@ func Status(args []string) {
 	}
 
 	objStore := objects.NewObjectStore(repo.GitDir)
+	refManager := refs.NewRefManager(repo.GitDir)
 
-	fmt.Println("On branch main") // TODO: Get current branch
-	fmt.Println()
+	// Get current branch name
+	currentBranch, err := refManager.GetCurrentBranch()
+	if err != nil || currentBranch == "" {
+		fmt.Println("On branch main") // Default fallback
+	} else {
+		fmt.Printf("On branch %s\n", currentBranch)
+	}
 
-	// Check for staged files
+	// Get HEAD commit and its tree
+	headCommitHash, err := refManager.GetHEAD()
+	var headTreeEntries map[string]*index.IndexEntry
+
+	if err != nil || headCommitHash == "" {
+		// No commits yet, so everything in index is staged
+		headTreeEntries = make(map[string]*index.IndexEntry)
+	} else {
+		// Get the tree from HEAD commit
+		headTreeEntries, err = getTreeEntriesFromCommit(objStore, headCommitHash)
+		if err != nil {
+			fmt.Printf("Error reading HEAD commit tree: %v\n", err)
+			headTreeEntries = make(map[string]*index.IndexEntry)
+		}
+	}
+
 	indexEntries := idx.GetAll()
-	if len(indexEntries) > 0 {
+
+	// Find staged changes (index vs HEAD)
+	stagedFiles := make([]string, 0)
+	for path, indexEntry := range indexEntries {
+		if headEntry, exists := headTreeEntries[path]; !exists {
+			// New file
+			stagedFiles = append(stagedFiles, fmt.Sprintf("new file:   %s", path))
+		} else if indexEntry.Hash != headEntry.Hash {
+			// Modified file
+			stagedFiles = append(stagedFiles, fmt.Sprintf("modified:   %s", path))
+		}
+	}
+
+	// Check for deleted files (in HEAD but not in index)
+	for path := range headTreeEntries {
+		if _, exists := indexEntries[path]; !exists {
+			stagedFiles = append(stagedFiles, fmt.Sprintf("deleted:    %s", path))
+		}
+	}
+
+	if len(stagedFiles) > 0 {
 		fmt.Println("Changes to be committed:")
 		fmt.Println("  (use \"mygit reset HEAD <file>...\" to unstage)")
 		fmt.Println()
-		for path := range indexEntries {
-			fmt.Printf("        new file:   %s\n", path)
+		for _, fileStatus := range stagedFiles {
+			fmt.Printf("        %s\n", fileStatus)
 		}
 		fmt.Println()
 	}
 
-	// Check for modified files
+	// Check for modified files (working directory vs index)
 	modifiedFiles := make([]string, 0)
 	for path, entry := range indexEntries {
 		fullPath := filepath.Join(repo.WorkDir, path)
@@ -57,14 +100,22 @@ func Status(args []string) {
 		info, err := os.Stat(fullPath)
 		if err != nil {
 			if os.IsNotExist(err) {
-				fmt.Printf("        deleted:    %s\n", path)
+				modifiedFiles = append(modifiedFiles, fmt.Sprintf("deleted:    %s", path))
 			}
 			continue
 		}
 
-		// Check if file was modified
-		if info.ModTime().After(entry.ModTime) {
-			// Read current content and hash it
+		// Improved modification check: compare file size first (faster)
+		if info.Size() != entry.Size {
+			// File size changed, definitely modified
+			modifiedFiles = append(modifiedFiles, fmt.Sprintf("modified:   %s", path))
+			continue
+		}
+
+		// Check modification time with tolerance for filesystem precision
+		modTimeDiff := info.ModTime().Sub(entry.ModTime)
+		if modTimeDiff > time.Second || modTimeDiff < -time.Second {
+			// Read current content and hash it to be sure
 			content, err := os.ReadFile(fullPath)
 			if err != nil {
 				continue
@@ -72,7 +123,17 @@ func Status(args []string) {
 
 			currentHash := objStore.HashObject(content, objects.BlobType)
 			if currentHash != entry.Hash {
-				modifiedFiles = append(modifiedFiles, path)
+				modifiedFiles = append(modifiedFiles, fmt.Sprintf("modified:   %s", path))
+			} else {
+				// File content is same but timestamp differs - update index timestamp
+				// This is an optimization to avoid future unnecessary hash computations
+				entry.ModTime = info.ModTime()
+				entry.Size = info.Size()
+				err = idx.Save()
+				if err != nil {
+					fmt.Printf("Error updating index: %v\n", err)
+				}
+				// Note: You might want to save the index here if you implement index updates
 			}
 		}
 	}
@@ -80,21 +141,22 @@ func Status(args []string) {
 	if len(modifiedFiles) > 0 {
 		fmt.Println("Changes not staged for commit:")
 		fmt.Println("  (use \"mygit add <file>...\" to update what will be committed)")
+		fmt.Println("  (use \"mygit checkout -- <file>...\" to discard changes in working directory)")
 		fmt.Println()
-		for _, path := range modifiedFiles {
-			fmt.Printf("        modified:   %s\n", path)
+		for _, fileStatus := range modifiedFiles {
+			fmt.Printf("        %s\n", fileStatus)
 		}
 		fmt.Println()
 	}
 
-	// Check for untracked files
+	// Check for untracked files with improved filtering
 	untrackedFiles := make([]string, 0)
 	err = filepath.Walk(repo.WorkDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		// Skip .mygit directory
+		// Skip .mygit directory and its contents
 		if strings.Contains(path, ".mygit") {
 			if info.IsDir() {
 				return filepath.SkipDir
@@ -102,7 +164,20 @@ func Status(args []string) {
 			return nil
 		}
 
-		// Skip directories
+		// Skip .git directory and its contents (if it exists)
+		if strings.Contains(path, ".git") && info.IsDir() {
+			return filepath.SkipDir
+		}
+
+		// Skip other common ignore patterns
+		if shouldIgnoreFile(info.Name()) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Skip directories themselves (we only care about files)
 		if info.IsDir() {
 			return nil
 		}
@@ -114,8 +189,11 @@ func Status(args []string) {
 		}
 		relPath = filepath.ToSlash(relPath)
 
-		// Check if file is tracked
-		if _, tracked := indexEntries[relPath]; !tracked {
+		// Check if file is tracked in either index or HEAD
+		_, trackedInIndex := indexEntries[relPath]
+		_, trackedInHead := headTreeEntries[relPath]
+
+		if !trackedInIndex && !trackedInHead {
 			untrackedFiles = append(untrackedFiles, relPath)
 		}
 
@@ -136,7 +214,100 @@ func Status(args []string) {
 		fmt.Println()
 	}
 
-	if len(indexEntries) == 0 && len(modifiedFiles) == 0 && len(untrackedFiles) == 0 {
+	if len(stagedFiles) == 0 && len(modifiedFiles) == 0 && len(untrackedFiles) == 0 {
 		fmt.Println("nothing to commit, working tree clean")
 	}
+}
+
+// Helper function to check if a file should be ignored
+func shouldIgnoreFile(filename string) bool {
+	ignoredPatterns := []string{
+		".DS_Store",  // macOS
+		"Thumbs.db",  // Windows
+		".gitignore", // Usually want to track this, but could be configurable
+		"*.tmp",
+		"*.swp",
+		".vscode",
+		"node_modules",
+	}
+
+	for _, pattern := range ignoredPatterns {
+		if strings.Contains(pattern, "*") {
+			// Simple wildcard matching
+			if strings.HasSuffix(filename, strings.TrimPrefix(pattern, "*")) {
+				return true
+			}
+		} else if filename == pattern {
+			return true
+		}
+	}
+	return false
+}
+
+// Helper function to extract tree entries from a commit
+func getTreeEntriesFromCommit(objStore *objects.ObjectStore, commitHash string) (map[string]*index.IndexEntry, error) {
+	// Read commit object
+	commitContent, err := objStore.ReadObject(commitHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read commit %s: %v", commitHash, err)
+	}
+
+	// Parse commit to get tree hash
+	commit, err := objects.ParseCommit(commitContent.Content)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse commit: %v", err)
+	}
+
+	// Get tree entries
+	return getTreeEntriesRecursive(objStore, commit.Tree, "")
+}
+
+// Helper function to recursively get all entries from a tree
+func getTreeEntriesRecursive(objStore *objects.ObjectStore, treeHash, prefix string) (map[string]*index.IndexEntry, error) {
+	entries := make(map[string]*index.IndexEntry)
+
+	// Read tree object
+	treeContent, err := objStore.ReadObject(treeHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read tree %s: %v", treeHash, err)
+	}
+
+	// Parse tree entries
+	tree, err := objects.ParseTree(treeContent.Content)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse tree: %v", err)
+	}
+
+	// Get entries from the tree object
+	treeEntries := tree.Entries
+	for _, entry := range treeEntries {
+		fullPath := entry.Name
+		if prefix != "" {
+			fullPath = prefix + "/" + entry.Name
+		}
+
+		if entry.Mode == "40000" { // Directory
+			// Recursively get entries from subdirectory
+			subEntries, err := getTreeEntriesRecursive(objStore, entry.Hash, fullPath)
+			if err != nil {
+				return nil, err
+			}
+			for path, subEntry := range subEntries {
+				entries[path] = subEntry
+			}
+		} else { // File
+			// Create an index entry for comparison
+			entries[fullPath] = &index.IndexEntry{
+				Path: fullPath,
+				Hash: entry.Hash,
+				// Note: We don't have size/time info from tree, but hash comparison is sufficient
+				// Set default values to avoid comparison issues
+				Size:        0,           // Size not available from tree
+				ModTime:     time.Time{}, // ModTime not available from tree
+				Permissions: 0644,        // Default file permissions
+			}
+		}
+	}
+
+	return entries, nil
 }

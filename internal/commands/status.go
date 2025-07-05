@@ -6,6 +6,7 @@ import (
 	"mygit/internal/objects"
 	"mygit/internal/refs"
 	"mygit/internal/repository"
+	"mygit/internal/utils"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,7 +54,7 @@ func Status(args []string) {
 		headTreeEntries = make(map[string]*index.IndexEntry)
 	} else {
 		// Get the tree from HEAD commit
-		headTreeEntries, err = getTreeEntriesFromCommit(objStore, headCommitHash)
+		headTreeEntries, err = utils.GetTreeEntriesFromCommit(objStore, headCommitHash)
 		if err != nil {
 			fmt.Printf("Error reading HEAD commit tree: %v\n", err)
 			headTreeEntries = make(map[string]*index.IndexEntry)
@@ -92,50 +93,9 @@ func Status(args []string) {
 	}
 
 	// Check for modified files (working directory vs index)
-	modifiedFiles := make([]string, 0)
-	for path, entry := range indexEntries {
-		fullPath := filepath.Join(repo.WorkDir, path)
-
-		// Check if file still exists
-		info, err := os.Stat(fullPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				modifiedFiles = append(modifiedFiles, fmt.Sprintf("deleted:    %s", path))
-			}
-			continue
-		}
-
-		// Improved modification check: compare file size first (faster)
-		if info.Size() != entry.Size {
-			// File size changed, definitely modified
-			modifiedFiles = append(modifiedFiles, fmt.Sprintf("modified:   %s", path))
-			continue
-		}
-
-		// Check modification time with tolerance for filesystem precision
-		modTimeDiff := info.ModTime().Sub(entry.ModTime)
-		if modTimeDiff > time.Second || modTimeDiff < -time.Second {
-			// Read current content and hash it to be sure
-			content, err := os.ReadFile(fullPath)
-			if err != nil {
-				continue
-			}
-
-			currentHash := objStore.HashObject(content, objects.BlobType)
-			if currentHash != entry.Hash {
-				modifiedFiles = append(modifiedFiles, fmt.Sprintf("modified:   %s", path))
-			} else {
-				// File content is same but timestamp differs - update index timestamp
-				// This is an optimization to avoid future unnecessary hash computations
-				entry.ModTime = info.ModTime()
-				entry.Size = info.Size()
-				err = idx.Save()
-				if err != nil {
-					fmt.Printf("Error updating index: %v\n", err)
-				}
-				// Note: You might want to save the index here if you implement index updates
-			}
-		}
+	modifiedFiles, err := utils.GetUnstagedChanges(repo, idx, objStore)
+	if err != nil {
+		fmt.Printf("Error checking for unstaged changes: %v\n", err)
 	}
 
 	if len(modifiedFiles) > 0 {
@@ -144,7 +104,7 @@ func Status(args []string) {
 		fmt.Println("  (use \"mygit checkout -- <file>...\" to discard changes in working directory)")
 		fmt.Println()
 		for _, fileStatus := range modifiedFiles {
-			fmt.Printf("        %s\n", fileStatus)
+			fmt.Printf("        modified:   %s\n", fileStatus)
 		}
 		fmt.Println()
 	}

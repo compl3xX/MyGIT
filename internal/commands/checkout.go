@@ -6,7 +6,9 @@ import (
 	"mygit/internal/objects"
 	"mygit/internal/refs"
 	"mygit/internal/repository"
+	"mygit/internal/utils"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -36,18 +38,45 @@ func Checkout(args []string) {
 	objStore := objects.NewObjectStore(repo.GitDir)
 	idx := index.NewIndex(repo.GitDir)
 
-	// Safety check: Ensure working directory is clean before checkout
-	// Note: This is a simplified check. A real implementation is more complex.
-	if err := idx.Load(); err == nil {
-		if len(idx.GetAll()) > 0 {
-			// A more robust check would compare index with HEAD and working dir
-			fmt.Println("Error: You have uncommitted changes. Please commit or stash them before switching branches.")
-			// os.Exit(1) // For this project, we'll allow it but warn the user.
-		}
+	// --- Full Safety Check ---
+	if err := idx.Load(); err != nil {
+		fmt.Printf("Error loading index: %v\n", err)
+		os.Exit(1)
 	}
 
+	// 1. Check for unstaged changes (working directory vs. index)
+	unstagedChanges, err := utils.GetUnstagedChanges(repo, idx, objStore)
+	if err != nil {
+		fmt.Printf("Error checking for unstaged changes: %v\n", err)
+		os.Exit(1)
+	}
+	if len(unstagedChanges) > 0 {
+		fmt.Println("error: Your local changes to the following files would be overwritten by checkout:")
+		for _, file := range unstagedChanges {
+			fmt.Printf("\t%s\n", file)
+		}
+		fmt.Println("Please commit your changes or stash them before you switch branches.")
+		os.Exit(1)
+	}
+
+	// 2. Check for staged changes (index vs. HEAD)
+	headCommitHash, _ := refManager.GetHEAD()
+	var headTree map[string]*index.IndexEntry
+	if headCommitHash != "" {
+		headTree, _ = utils.GetTreeEntriesFromCommit(objStore, headCommitHash)
+	} else {
+		headTree = make(map[string]*index.IndexEntry) // Empty repo, empty tree
+	}
+
+	if isDirty(idx, headTree) {
+		fmt.Println("error: Your local changes would be overwritten by checkout.")
+		fmt.Println("Please commit your changes or stash them before you switch branches.")
+		os.Exit(1)
+	}
+	// --- End of Safety Check ---
+
 	// Get the commit hash for the target branch
-	targetRef := filepath.Join("refs", "heads", branchName)
+	targetRef := path.Join("refs", "heads", branchName)
 	targetCommitHash, err := refManager.GetRef(targetRef)
 	if err != nil || targetCommitHash == "" {
 		fmt.Printf("Error: branch '%s' not found.\n", branchName)
@@ -91,18 +120,39 @@ func Checkout(args []string) {
 	fmt.Printf("Switched to branch '%s'\n", branchName)
 }
 
+// isDirty checks if there are any differences between the index and HEAD tree.
+func isDirty(idx *index.Index, headTree map[string]*index.IndexEntry) bool {
+	indexEntries := idx.GetAll()
+
+	// Check for additions or modifications
+	for path, indexEntry := range indexEntries {
+		if headEntry, exists := headTree[path]; !exists || headEntry.Hash != indexEntry.Hash {
+			return true
+		}
+	}
+
+	// Check for deletions
+	for path := range headTree {
+		if _, exists := indexEntries[path]; !exists {
+			return true
+		}
+	}
+
+	return false
+}
+
 // clearWorkingDirectory removes all files and directories tracked in the index.
 func clearWorkingDirectory(repo *repository.GitRepository, idx *index.Index) error {
+	// It's safer to load the index again to ensure we have the right file list.
+	idx.Load()
 	for path := range idx.GetAll() {
 		fullPath := filepath.Join(repo.WorkDir, path)
 		if err := os.Remove(fullPath); err != nil {
-			// Ignore errors if file doesn't exist, but return others
 			if !os.IsNotExist(err) {
 				return err
 			}
 		}
 	}
-	// This simplified version doesn't remove empty directories.
 	return nil
 }
 

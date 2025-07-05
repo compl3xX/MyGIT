@@ -33,6 +33,8 @@ func main() {
 		commands.Branch(args)
 	case "checkout":
 		commands.Checkout(args)
+	case "show":
+		commands.Show(args)
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
 		os.Exit(1)

@@ -9,8 +9,6 @@ import (
 	"mygit/internal/utils"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
 )
 
 func Status(args []string) {
@@ -36,6 +34,13 @@ func Status(args []string) {
 
 	objStore := objects.NewObjectStore(repo.GitDir)
 	refManager := refs.NewRefManager(repo.GitDir)
+
+	// Load .gitignore patterns
+	ignore, err := utils.NewIgnore(repo.WorkDir)
+	if err != nil {
+		fmt.Printf("Error loading .gitignore: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Get current branch name
 	currentBranch, err := refManager.GetCurrentBranch()
@@ -116,21 +121,13 @@ func Status(args []string) {
 			return err
 		}
 
-		// Skip .mygit directory and its contents
-		if strings.Contains(path, ".mygit") {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
+		relPath, err := filepath.Rel(repo.WorkDir, path)
+		if err != nil {
 			return nil
 		}
+		relPath = filepath.ToSlash(relPath)
 
-		// Skip .git directory and its contents (if it exists)
-		if strings.Contains(path, ".git") && info.IsDir() {
-			return filepath.SkipDir
-		}
-
-		// Skip other common ignore patterns
-		if shouldIgnoreFile(info.Name()) {
+		if ignore.IsIgnored(relPath) {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
@@ -141,13 +138,6 @@ func Status(args []string) {
 		if info.IsDir() {
 			return nil
 		}
-
-		// Get relative path
-		relPath, err := filepath.Rel(repo.WorkDir, path)
-		if err != nil {
-			return nil
-		}
-		relPath = filepath.ToSlash(relPath)
 
 		// Check if file is tracked in either index or HEAD
 		_, trackedInIndex := indexEntries[relPath]
@@ -177,97 +167,4 @@ func Status(args []string) {
 	if len(stagedFiles) == 0 && len(modifiedFiles) == 0 && len(untrackedFiles) == 0 {
 		fmt.Println("nothing to commit, working tree clean")
 	}
-}
-
-// Helper function to check if a file should be ignored
-func shouldIgnoreFile(filename string) bool {
-	ignoredPatterns := []string{
-		".DS_Store",  // macOS
-		"Thumbs.db",  // Windows
-		".gitignore", // Usually want to track this, but could be configurable
-		"*.tmp",
-		"*.swp",
-		".vscode",
-		"node_modules",
-	}
-
-	for _, pattern := range ignoredPatterns {
-		if strings.Contains(pattern, "*") {
-			// Simple wildcard matching
-			if strings.HasSuffix(filename, strings.TrimPrefix(pattern, "*")) {
-				return true
-			}
-		} else if filename == pattern {
-			return true
-		}
-	}
-	return false
-}
-
-// Helper function to extract tree entries from a commit
-func getTreeEntriesFromCommit(objStore *objects.ObjectStore, commitHash string) (map[string]*index.IndexEntry, error) {
-	// Read commit object
-	commitContent, err := objStore.ReadObject(commitHash)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read commit %s: %v", commitHash, err)
-	}
-
-	// Parse commit to get tree hash
-	commit, err := objects.ParseCommit(commitContent.Content)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse commit: %v", err)
-	}
-
-	// Get tree entries
-	return getTreeEntriesRecursive(objStore, commit.Tree, "")
-}
-
-// Helper function to recursively get all entries from a tree
-func getTreeEntriesRecursive(objStore *objects.ObjectStore, treeHash, prefix string) (map[string]*index.IndexEntry, error) {
-	entries := make(map[string]*index.IndexEntry)
-
-	// Read tree object
-	treeContent, err := objStore.ReadObject(treeHash)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read tree %s: %v", treeHash, err)
-	}
-
-	// Parse tree entries
-	tree, err := objects.ParseTree(treeContent.Content)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse tree: %v", err)
-	}
-
-	// Get entries from the tree object
-	treeEntries := tree.Entries
-	for _, entry := range treeEntries {
-		fullPath := entry.Name
-		if prefix != "" {
-			fullPath = prefix + "/" + entry.Name
-		}
-
-		if entry.Mode == "40000" { // Directory
-			// Recursively get entries from subdirectory
-			subEntries, err := getTreeEntriesRecursive(objStore, entry.Hash, fullPath)
-			if err != nil {
-				return nil, err
-			}
-			for path, subEntry := range subEntries {
-				entries[path] = subEntry
-			}
-		} else { // File
-			// Create an index entry for comparison
-			entries[fullPath] = &index.IndexEntry{
-				Path: fullPath,
-				Hash: entry.Hash,
-				// Note: We don't have size/time info from tree, but hash comparison is sufficient
-				// Set default values to avoid comparison issues
-				Size:        0,           // Size not available from tree
-				ModTime:     time.Time{}, // ModTime not available from tree
-				Permissions: 0644,        // Default file permissions
-			}
-		}
-	}
-
-	return entries, nil
 }

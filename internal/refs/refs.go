@@ -8,15 +8,15 @@ import (
 )
 
 type RefManager struct {
-	gitDir string
+	GitDir string
 }
 
-func NewRefManager(gitDir string) *RefManager {
-	return &RefManager{gitDir: gitDir}
+func NewRefManager(GitDir string) *RefManager {
+	return &RefManager{GitDir: GitDir}
 }
 
 func (rm *RefManager) GetHEAD() (string, error) {
-	headPath := filepath.Join(rm.gitDir, "HEAD")
+	headPath := filepath.Join(rm.GitDir, "HEAD")
 	content, err := os.ReadFile(headPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read HEAD: %w", err)
@@ -35,7 +35,7 @@ func (rm *RefManager) GetHEAD() (string, error) {
 }
 
 func (rm *RefManager) GetRef(refPath string) (string, error) {
-	fullPath := filepath.Join(rm.gitDir, refPath)
+	fullPath := filepath.Join(rm.GitDir, refPath)
 	content, err := os.ReadFile(fullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -48,7 +48,7 @@ func (rm *RefManager) GetRef(refPath string) (string, error) {
 }
 
 func (rm *RefManager) SetRef(refPath, hash string) error {
-	fullPath := filepath.Join(rm.gitDir, refPath)
+	fullPath := filepath.Join(rm.GitDir, refPath)
 
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(fullPath)
@@ -64,7 +64,7 @@ func (rm *RefManager) SetRef(refPath, hash string) error {
 }
 
 func (rm *RefManager) GetCurrentBranch() (string, error) {
-	headPath := filepath.Join(rm.gitDir, "HEAD")
+	headPath := filepath.Join(rm.GitDir, "HEAD")
 	content, err := os.ReadFile(headPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read HEAD: %w", err)
@@ -87,4 +87,11 @@ func (rm *RefManager) UpdateCurrentBranch(hash string) error {
 
 	refPath := fmt.Sprintf("refs/heads/%s", branch)
 	return rm.SetRef(refPath, hash)
+}
+
+// SetHEAD updates the HEAD file to point to the specified ref.
+func (rm *RefManager) SetHEAD(refPath string) error {
+	headPath := filepath.Join(rm.GitDir, "HEAD")
+	headContent := fmt.Sprintf("ref: %s", refPath)
+	return os.WriteFile(headPath, []byte(headContent), 0644)
 }

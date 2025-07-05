@@ -27,7 +27,12 @@ func main() {
 		commands.Log(args)
 	case "status":
 		commands.Status(args)
-
+	case "push":
+		commands.Push(args)
+	case "branch":
+		commands.Branch(args)
+	case "checkout":
+		commands.Checkout(args)
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
 		os.Exit(1)

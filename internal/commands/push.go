@@ -369,7 +369,7 @@ func (gp *GitPush) getObjectTypeNumber(objType objects.ObjectType) int {
 
 // GetCurrentBranchCommit returns the current commit hash for a branch
 func (gp *GitPush) GetCurrentBranchCommit() (string, error) {
-	branchPath := filepath.Join(gp.repoPath, ".git", "refs", "heads", gp.branch)
+	branchPath := filepath.Join(gp.repoPath, ".mygit", "refs", "heads", gp.branch)
 
 	data, err := os.ReadFile(branchPath)
 	if err != nil {
@@ -381,7 +381,7 @@ func (gp *GitPush) GetCurrentBranchCommit() (string, error) {
 
 // GetRemoteURL returns the URL for the specified remote
 func (gp *GitPush) GetRemoteURL() (string, error) {
-	configPath := filepath.Join(gp.repoPath, ".git", "config")
+	configPath := filepath.Join(gp.repoPath, ".mygit", "config")
 
 	file, err := os.Open(configPath)
 	if err != nil {

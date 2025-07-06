@@ -36,8 +36,8 @@ func (c *Commit) Serialize() []byte {
 	}
 
 	// Timestamp
-	timestamp := time.Now().Unix()
-	_, offset := time.Now().Zone()
+	timestamp := c.Timestamp.Unix()
+	_, offset := c.Timestamp.Zone()
 	sign := "+"
 	if offset < 0 {
 		sign = "-"
@@ -46,10 +46,9 @@ func (c *Commit) Serialize() []byte {
 	timezone := fmt.Sprintf("%s%02d%02d", sign, offset/3600, (offset%3600)/60)
 
 	buf.WriteString(fmt.Sprintf("author %s %d %s\n", c.Author, timestamp, timezone))
-	buf.WriteString(fmt.Sprintf("committer %s %d %s\n", c.Author, timestamp, timezone))
+	buf.WriteString(fmt.Sprintf("committer %s %d %s\n", c.Committer, timestamp, timezone))
 	buf.WriteString("\n")
 	buf.WriteString(c.Message)
-	buf.WriteString("\n")
 
 	return buf.Bytes()
 }
@@ -93,12 +92,16 @@ func ParseCommit(content []byte) (*Commit, error) {
 
 func parsePersonWithTimestamp(line string) string {
 	// Format: "Name <email> timestamp timezone"
-	// For simplicity, just return the name and email part
-	parts := strings.Fields(line)
-	if len(parts) >= 2 {
-		// Find the last two parts (timestamp and timezone) and exclude them
-		nameEmailParts := parts[:len(parts)-2]
-		return strings.Join(nameEmailParts, " ")
+	// Find the closing bracket of the email to handle names with spaces
+	lastAngle := strings.LastIndex(line, ">")
+	if lastAngle == -1 {
+		// Fallback for unexpected format, though this shouldn't happen with valid commits
+		parts := strings.Fields(line)
+		if len(parts) > 2 {
+			return strings.Join(parts[:len(parts)-2], " ")
+		}
+		return line
 	}
-	return line
+	// The name and email part is everything up to and including the closing angle bracket
+	return line[:lastAngle+1]
 }

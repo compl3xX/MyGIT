@@ -37,12 +37,17 @@ func (t *Tree) AddEntry(mode, name, hash string, objType ObjectType) {
 }
 
 func (t *Tree) Serialize() []byte {
+	// Sort entries by name as required by Git
+	sort.Slice(t.Entries, func(i, j int) bool {
+		return t.Entries[i].Name < t.Entries[j].Name
+	})
+
 	var buf bytes.Buffer
 
 	validModes := map[string]bool{
 		"100644": true,
 		"100755": true,
-		"40000":  true,
+		"040000": true, // Corrected mode for directories
 	}
 
 	for _, entry := range t.Entries {
@@ -105,7 +110,7 @@ func ParseTree(content []byte) (*Tree, error) {
 		var objType ObjectType
 		if mode == "100644" || mode == "100755" {
 			objType = BlobType
-		} else if mode == "40000" {
+		} else if mode == "040000" { // Corrected mode for directories
 			objType = TreeType
 		} else {
 			objType = BlobType // Default
@@ -118,148 +123,54 @@ func ParseTree(content []byte) (*Tree, error) {
 }
 
 func (os *ObjectStore) BuildTreeFromIndex(indexEntries map[string]*index.IndexEntry) (string, error) {
-	// Build tree structure from flat index
-	treeMap := make(map[string]*Tree)
+	// Group entries by directory
+	rootDir := &treeNode{name: "", children: make(map[string]*treeNode), entries: make([]TreeEntry, 0)}
 
-	// Create root tree
-	treeMap[""] = NewTree()
-
-	// First pass: create all directories and collect all paths
-	allDirs := make(map[string]bool)
-
-	for path := range indexEntries {
-		parts := strings.Split(filepath.ToSlash(path), "/")
-
-		// Add all directory paths
-		currentPath := ""
-		for i := 0; i < len(parts)-1; i++ {
-			if currentPath == "" {
-				currentPath = parts[i]
-			} else {
-				currentPath = currentPath + "/" + parts[i]
-			}
-			allDirs[currentPath] = true
-		}
-	}
-
-	// Create trees for all directories
-	for dir := range allDirs {
-		treeMap[dir] = NewTree()
-	}
-
-	// Second pass: build directory hierarchy
-	for dir := range allDirs {
-		parts := strings.Split(dir, "/")
-		dirName := parts[len(parts)-1]
-
-		// Find parent path
-		var parentPath string
-		if len(parts) == 1 {
-			parentPath = "" // root
-		} else {
-			parentPath = strings.Join(parts[:len(parts)-1], "/")
-		}
-
-		// Add this directory to its parent
-		if parentTree, exists := treeMap[parentPath]; exists {
-			// Check if already added
-			found := false
-			for _, e := range parentTree.Entries {
-				if e.Name == dirName && e.Type == TreeType {
-					found = true
-					break
-				}
-			}
-			if !found {
-				parentTree.AddEntry("40000", dirName, "PLACEHOLDER", TreeType)
-			}
-		}
-	}
-
-	// Third pass: add files to their parent directories
 	for path, entry := range indexEntries {
 		parts := strings.Split(filepath.ToSlash(path), "/")
+		currentNode := rootDir
+
+		for _, part := range parts[:len(parts)-1] {
+			if _, ok := currentNode.children[part]; !ok {
+				currentNode.children[part] = &treeNode{name: part, children: make(map[string]*treeNode), entries: make([]TreeEntry, 0)}
+			}
+			currentNode = currentNode.children[part]
+		}
+
 		fileName := parts[len(parts)-1]
-
-		// Find parent directory
-		var parentPath string
-		if len(parts) == 1 {
-			parentPath = "" // root
-		} else {
-			parentPath = strings.Join(parts[:len(parts)-1], "/")
+		mode := "100644"
+		if entry.Permissions&0111 != 0 {
+			mode = "100755"
 		}
-
-		if parentTree, exists := treeMap[parentPath]; exists {
-			mode := "100644"
-			if entry.Permissions&0111 != 0 {
-				mode = "100755"
-			}
-			parentTree.AddEntry(mode, fileName, entry.Hash, BlobType)
-		}
+		currentNode.entries = append(currentNode.entries, TreeEntry{Mode: mode, Name: fileName, Hash: entry.Hash, Type: BlobType})
 	}
 
-	// Write trees to object store (bottom-up)
-	treeHashes := make(map[string]string)
+	// Recursively write trees to the object store
+	return writeTreeRecursive(os, rootDir)
+}
 
-	// Sort paths by depth (deepest first)
-	var paths []string
-	for path := range treeMap {
-		paths = append(paths, path)
-	}
-	sort.Slice(paths, func(i, j int) bool {
-		depthI := strings.Count(paths[i], "/")
-		depthJ := strings.Count(paths[j], "/")
-		if paths[i] == "" {
-			depthI = -1 // Root should be last
-		}
-		if paths[j] == "" {
-			depthJ = -1 // Root should be last
-		}
-		return depthI > depthJ
-	})
+// treeNode represents a node in the tree structure (either a directory or a file)
+type treeNode struct {
+	name     string
+	children map[string]*treeNode
+	entries  []TreeEntry
+}
 
-	fmt.Printf("DEBUG: Processing trees in order: %v\n", paths)
-
-	// Write each tree
-	for _, path := range paths {
-		tree := treeMap[path]
-
-		fmt.Printf("DEBUG: Processing tree for path '%s' with %d entries\n", path, len(tree.Entries))
-
-		// Fill in subtree hashes
-		for i, entry := range tree.Entries {
-			if entry.Type == TreeType && entry.Hash == "PLACEHOLDER" {
-				subPath := path
-				if subPath == "" {
-					subPath = entry.Name
-				} else {
-					subPath = subPath + "/" + entry.Name
-				}
-
-				fmt.Printf("DEBUG: Looking for hash for subtree: '%s'\n", subPath)
-				if hash, exists := treeHashes[subPath]; exists {
-					fmt.Printf("DEBUG: Found hash for '%s': %s\n", subPath, hash)
-					tree.Entries[i].Hash = hash
-				} else {
-					fmt.Printf("DEBUG: Available tree hashes: %v\n", treeHashes)
-					return "", fmt.Errorf("missing hash for subtree: %s", subPath)
-				}
-			}
-		}
-
-		// Serialize and write tree
-		treeContent := tree.Serialize()
-		hash, err := os.WriteObject(treeContent, TreeType)
+// writeTreeRecursive writes a tree and its children to the object store and returns the tree's hash.
+func writeTreeRecursive(os *ObjectStore, node *treeNode) (string, error) {
+	// First, write all child trees and get their hashes
+	for name, childNode := range node.children {
+		childHash, err := writeTreeRecursive(os, childNode)
 		if err != nil {
-			return "", fmt.Errorf("failed to write tree object: %w", err)
+			return "", err
 		}
-
-		treeHashes[path] = hash
-		fmt.Printf("DEBUG: Stored tree hash for path '%s': %s\n", path, hash)
+		node.entries = append(node.entries, TreeEntry{Mode: "040000", Name: name, Hash: childHash, Type: TreeType}) // Corrected mode
 	}
 
-	// Return root tree hash
-	rootHash := treeHashes[""]
-	fmt.Printf("DEBUG: Returning root tree hash: %s\n", rootHash)
-	return rootHash, nil
+	// Now, create a Tree object from the entries and serialize it
+	tree := &Tree{Entries: node.entries}
+	treeContent := tree.Serialize() // This already sorts the entries
+
+	// Write the tree object to the store
+	return os.WriteObject(treeContent, TreeType)
 }

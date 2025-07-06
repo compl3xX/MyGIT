@@ -44,18 +44,14 @@ func (idx *Index) Load() error {
 	}
 	defer file.Close()
 
-	lineCount := 0
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		lineCount++
-		line := strings.TrimSpace(scanner.Text())
-		fmt.Printf("DEBUG: Reading index line %d: '%s'\n", lineCount, line)
-
+		line := scanner.Text()
 		if line == "" {
 			continue
 		}
 
-		parts := strings.SplitN(line, " ", 5)
+		parts := strings.Split(line, "\x00")
 		if len(parts) != 5 {
 			fmt.Printf("DEBUG: Skipping malformed line with %d parts\n", len(parts))
 			continue
@@ -65,7 +61,7 @@ func (idx *Index) Load() error {
 		hash := parts[1]
 		size, _ := strconv.ParseInt(parts[2], 10, 64)
 		modTimeUnix, _ := strconv.ParseInt(parts[3], 10, 64)
-		permsInt, _ := strconv.ParseUint(parts[4], 10, 32)
+		permsInt, _ := strconv.ParseUint(parts[4], 8, 32) // Corrected base to 8 for octal
 
 		fmt.Printf("DEBUG: Loaded entry - Path: '%s', Hash: '%s' (len: %d), Size: %d\n",
 			path, hash, len(hash), size)
@@ -94,8 +90,12 @@ func (idx *Index) Save() error {
 	}
 	defer file.Close()
 
+	writer := bufio.NewWriter(file)
+	defer writer.Flush()
+
 	for path, entry := range idx.entries {
-		line := fmt.Sprintf("%s %s %d %d %d\n",
+		// Use null character as a separator for robustness
+		line := fmt.Sprintf("%s\x00%s\x00%d\x00%d\x00%o\n",
 			entry.Path,
 			entry.Hash,
 			entry.Size,
@@ -104,7 +104,7 @@ func (idx *Index) Save() error {
 
 		fmt.Printf("DEBUG: Writing index line for '%s': '%s'\n", path, strings.TrimSpace(line))
 
-		if _, err := file.WriteString(line); err != nil {
+		if _, err := writer.WriteString(line); err != nil {
 			return fmt.Errorf("failed to write to index file: %w", err)
 		}
 	}

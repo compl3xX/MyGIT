@@ -3,12 +3,14 @@ package commands
 import (
 	"bufio"
 	"fmt"
+	"mygit/internal/config"
 	"mygit/internal/index"
 	"mygit/internal/objects"
 	"mygit/internal/refs"
 	"mygit/internal/repository"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 )
 
@@ -85,7 +87,7 @@ func Commit(args []string) {
 	}
 
 	// Get author info
-	author := getAuthor()
+	author := getAuthor(repo)
 
 	// Create commit object
 	commit := objects.NewCommit(treeHash, message, author, parents)
@@ -107,19 +109,29 @@ func Commit(args []string) {
 	fmt.Printf(" %d files changed\n", len(indexEntries))
 }
 
-func getAuthor() string {
-	// Try to get from environment variables first
-	if name := os.Getenv("GIT_AUTHOR_NAME"); name != "" {
-		if email := os.Getenv("GIT_AUTHOR_EMAIL"); email != "" {
-			return fmt.Sprintf("%s <%s>", name, email)
+func getAuthor(repo *repository.GitRepository) string {
+	configPath := filepath.Join(repo.GitDir, "config")
+	cfg := config.NewConfig(configPath)
+	if err := cfg.Load(); err != nil {
+		// Fall back to system user if config can't be loaded
+		currentUser, err := user.Current()
+		if err != nil {
+			return "Unknown User <unknown@example.com>"
 		}
+		return fmt.Sprintf("%s <%s@localhost>", currentUser.Username, currentUser.Username)
 	}
 
-	// Fall back to system user
+	name, okName := cfg.Get("user.name")
+	email, okEmail := cfg.Get("user.email")
+
+	if okName && okEmail {
+		return fmt.Sprintf("%s <%s>", name, email)
+	}
+
+	// Fall back to system user if config is incomplete
 	currentUser, err := user.Current()
 	if err != nil {
 		return "Unknown User <unknown@example.com>"
 	}
-
 	return fmt.Sprintf("%s <%s@localhost>", currentUser.Username, currentUser.Username)
 }

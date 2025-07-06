@@ -94,7 +94,7 @@ Switches branches or restores working tree files.
 - `mygit checkout` only supports switching branches.
 - The real `git checkout` has many more options, such as creating new branches, detaching HEAD, and restoring files from a specific commit.
 
-### `push`
+### `push` (Not Working)
 
 Updates remote refs along with associated objects.
 

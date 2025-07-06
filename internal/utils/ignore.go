@@ -53,13 +53,34 @@ func (i *Ignore) IsIgnored(path string) bool {
 		return true
 	}
 
+	path = filepath.ToSlash(path) // Normalize path to use forward slashes.
+
 	for _, pattern := range i.patterns {
-		// Use filepath.Match for glob pattern matching.
+		// Handle directory patterns (e.g., "/logs/" or "node_modules/").
+		if strings.HasSuffix(pattern, "/") {
+			pattern = strings.TrimSuffix(pattern, "/") // Remove trailing slash.
+			// If the pattern starts with a slash, it should match from the root.
+			if strings.HasPrefix(pattern, "/") {
+				pattern = strings.TrimPrefix(pattern, "/")
+				if path == pattern || strings.HasPrefix(path, pattern+"/") {
+					return true
+				}
+			} else {
+				// Otherwise, it can match any directory with that name.
+				if path == pattern || strings.HasPrefix(path, pattern+"/") || strings.Contains(path, "/"+pattern+"/") {
+					return true
+				}
+			}
+			continue // Skip other checks for this pattern.
+		}
+
+		// Use filepath.Match for glob pattern matching on the base name.
 		matched, err := filepath.Match(pattern, filepath.Base(path))
 		if err == nil && matched {
 			return true
 		}
-		// Also check against the full path for patterns like `logs/` or `build/*`
+
+		// Also check against the full path for patterns like `build/*`.
 		matched, err = filepath.Match(pattern, path)
 		if err == nil && matched {
 			return true

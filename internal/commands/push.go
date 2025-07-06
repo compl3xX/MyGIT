@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
-	"encoding/hex"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"mygit/internal/objects"
@@ -18,23 +18,6 @@ import (
 	"strings"
 	"time"
 )
-
-// DeltaEntry represents a delta-compressed object
-type DeltaEntry struct {
-	BaseHash string
-	Data     []byte
-	Size     int
-}
-
-// PackObject represents an object in a pack file
-type PackObject struct {
-	Hash   string
-	Type   objects.ObjectType
-	Size   int
-	Data   []byte
-	Delta  *DeltaEntry
-	Offset int64
-}
 
 // GitPush handles the push operation with HTTPS protocol
 type GitPush struct {
@@ -139,218 +122,94 @@ func NewGitPush(repoPath, remote, branch string, opts *PushOptions) *GitPush {
 	return gp
 }
 
-// CreateDelta creates a delta between two objects
-func (gp *GitPush) CreateDelta(baseObj, targetObj *objects.Object) []byte {
-	baseData := baseObj.Content
-	targetData := targetObj.Content
+// CreatePackFile creates a simple pack file without delta compression
 
-	if len(baseData) == 0 || len(targetData) == 0 {
-		return nil
-	}
-
-	// Simple delta implementation - in production, use a more sophisticated algorithm
-	var delta bytes.Buffer
-
-	// Write base object size
-	gp.writeVarInt(&delta, len(baseData))
-	// Write target object size
-	gp.writeVarInt(&delta, len(targetData))
-
-	// Find common subsequences and encode differences
-	i, j := 0, 0
-	for i < len(baseData) && j < len(targetData) {
-		// Find matching sequences
-		matchLen := 0
-		for i+matchLen < len(baseData) && j+matchLen < len(targetData) &&
-			baseData[i+matchLen] == targetData[j+matchLen] {
-			matchLen++
-		}
-
-		if matchLen > 4 { // Only worth encoding if match is significant
-			// Copy instruction: offset and length from base
-			delta.WriteByte(0x80 | 0x10 | 0x01) // Copy instruction with offset and size
-			gp.writeVarInt(&delta, i)
-			gp.writeVarInt(&delta, matchLen)
-			i += matchLen
-			j += matchLen
-		} else {
-			// Insert instruction: copy from target
-			insertLen := 1
-			for j+insertLen < len(targetData) && insertLen < 127 {
-				// Look ahead to see if we should continue inserting
-				nextMatchLen := 0
-				for i+nextMatchLen < len(baseData) && j+insertLen+nextMatchLen < len(targetData) &&
-					baseData[i+nextMatchLen] == targetData[j+insertLen+nextMatchLen] {
-					nextMatchLen++
-				}
-				if nextMatchLen > 4 {
-					break
-				}
-				insertLen++
-			}
-
-			delta.WriteByte(byte(insertLen)) // Insert instruction
-			delta.Write(targetData[j : j+insertLen])
-			j += insertLen
-		}
-	}
-
-	// Handle remaining data
-	if j < len(targetData) {
-		remaining := len(targetData) - j
-		delta.WriteByte(byte(remaining))
-		delta.Write(targetData[j:])
-	}
-
-	return delta.Bytes()
-}
-
-// writeVarInt writes a variable-length integer
-func (gp *GitPush) writeVarInt(w *bytes.Buffer, value int) {
-	for value >= 0x80 {
-		w.WriteByte(byte(value) | 0x80)
-		value >>= 7
-	}
-	w.WriteByte(byte(value))
-}
-
-// CreatePackFileWithDelta creates an optimized pack file with delta compression
-func (gp *GitPush) CreatePackFileWithDelta(objectHashes []string, objStore *objects.ObjectStore) ([]byte, error) {
+// CreatePackFile creates a simple pack file without delta compression
+func (gp *GitPush) CreatePackFile(objectHashes []string, objStore *objects.ObjectStore) ([]byte, error) {
 	var buf bytes.Buffer
-	var packObjects []*PackObject
 
-	// Load all objects and create pack objects
-	objectMap := make(map[string]*objects.Object)
+	// Write pack header: "PACK" + version (4 bytes) + number of objects (4 bytes)
+	buf.WriteString("PACK")
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x02}) // Version 2
+
+	numObjects := uint32(len(objectHashes))
+	if err := binary.Write(&buf, binary.BigEndian, numObjects); err != nil {
+		return nil, fmt.Errorf("failed to write object count: %w", err)
+	}
+
+	// Write all objects
 	for _, hash := range objectHashes {
 		obj, err := objStore.ReadObject(hash)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read object %s: %w", hash, err)
 		}
-		objectMap[hash] = obj
 
-		packObj := &PackObject{
-			Hash: hash,
-			Type: obj.Type,
-			Size: obj.Size,
-			Data: obj.Content,
+		var objHeader string
+		switch obj.Type {
+		case objects.CommitType:
+			objHeader = fmt.Sprintf("commit %d\u0000", len(obj.Content))
+		case objects.TreeType:
+			objHeader = fmt.Sprintf("tree %d\u0000", len(obj.Content))
+		case objects.BlobType:
+			objHeader = fmt.Sprintf("blob %d\u0000", len(obj.Content))
+		default:
+			return nil, fmt.Errorf("unknown object type: %s", obj.Type)
 		}
-		packObjects = append(packObjects, packObj)
-	}
 
-	// Create deltas for similar objects (simple strategy: same type and similar size)
-	for i, obj := range packObjects {
-		if obj.Type == objects.BlobType || obj.Type == objects.TreeType {
-			bestBase := -1
-			bestDelta := []byte(nil)
-			bestRatio := 0.5 // Only use delta if it saves at least 50%
-
-			for j, base := range packObjects[:i] {
-				if base.Type == obj.Type && base.Delta == nil {
-					sizeDiff := float64(abs(base.Size-obj.Size)) / float64(max(base.Size, obj.Size))
-					if sizeDiff < 0.5 { // Only try delta if sizes are similar
-						delta := gp.CreateDelta(objectMap[base.Hash], objectMap[obj.Hash])
-						if len(delta) > 0 {
-							ratio := float64(len(delta)) / float64(len(obj.Data))
-							if ratio < bestRatio {
-								bestBase = j
-								bestDelta = delta
-								bestRatio = ratio
-							}
-						}
-					}
-				}
-			}
-
-			if bestBase >= 0 {
-				obj.Delta = &DeltaEntry{
-					BaseHash: packObjects[bestBase].Hash,
-					Data:     bestDelta,
-					Size:     len(bestDelta),
-				}
-			}
+		fullContent := append([]byte(objHeader), obj.Content...)
+		err = writeObjectToPack(&buf, fullContent, gp.getObjectTypeNumber(obj.Type))
+		if err != nil {
+			return nil, fmt.Errorf("failed to write object %s to pack: %w", hash, err)
 		}
 	}
 
-	// Pack file header
-	buf.WriteString("PACK")
-	buf.Write([]byte{0, 0, 0, 2}) // version 2
-
-	// Number of objects (4 bytes, big endian)
-	numObjects := len(packObjects)
-	buf.WriteByte(byte(numObjects >> 24))
-	buf.WriteByte(byte(numObjects >> 16))
-	buf.WriteByte(byte(numObjects >> 8))
-	buf.WriteByte(byte(numObjects))
-
-	// Write objects
-	for _, packObj := range packObjects {
-		var objType int
-		var data []byte
-		var size int
-
-		if packObj.Delta != nil {
-			objType = 7 // OBJ_REF_DELTA
-			data = packObj.Delta.Data
-			size = packObj.Delta.Size
-		} else {
-			objType = gp.getObjectTypeNumber(packObj.Type)
-			data = packObj.Data
-			size = len(data)
-		}
-
-		// Encode type and size
-		firstByte := (objType << 4) | (size & 0x0f)
-		if size >= 16 {
-			firstByte |= 0x80
-		}
-		buf.WriteByte(byte(firstByte))
-
-		size >>= 4
-		for size > 0 {
-			b := byte(size & 0x7f)
-			size >>= 7
-			if size > 0 {
-				b |= 0x80
-			}
-			buf.WriteByte(b)
-		}
-
-		// For delta objects, write base reference
-		if packObj.Delta != nil {
-			// Write base hash (20 bytes)
-			baseHash, _ := hex.DecodeString(packObj.Delta.BaseHash)
-			buf.Write(baseHash)
-		}
-
-		// Compress and write object data
-		var compressed bytes.Buffer
-		zlibWriter := zlib.NewWriter(&compressed)
-		zlibWriter.Write(data)
-		zlibWriter.Close()
-
-		buf.Write(compressed.Bytes())
-	}
-
-	// Calculate and append checksum
-	hash := sha1.Sum(buf.Bytes())
-	buf.Write(hash[:])
+	// Append SHA-1 checksum of the entire pack (excluding the checksum itself)
+	checksum := sha1.Sum(buf.Bytes())
+	buf.Write(checksum[:])
 
 	return buf.Bytes(), nil
 }
+func writeObjectToPack(w io.Writer, content []byte, objType int) error {
+	size := len(content)
 
-// Helper functions
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
+	// Encode type and size as variable-length header
+	var header []byte
+	firstByte := byte((objType << 4) | (size & 0x0f))
+	size >>= 4
 
-func max(a, b int) int {
-	if a > b {
-		return a
+	if size > 0 {
+		firstByte |= 0x80 // continuation bit
 	}
-	return b
+	header = append(header, firstByte)
+
+	for size > 0 {
+		b := byte(size & 0x7f)
+		size >>= 7
+		if size > 0 {
+			b |= 0x80
+		}
+		header = append(header, b)
+	}
+
+	if _, err := w.Write(header); err != nil {
+		return fmt.Errorf("failed to write object header: %w", err)
+	}
+
+	// Zlib compress the object content
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	if _, err := zw.Write(content); err != nil {
+		return fmt.Errorf("zlib write error: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("zlib close error: %w", err)
+	}
+
+	if _, err := w.Write(compressed.Bytes()); err != nil {
+		return fmt.Errorf("failed to write compressed object: %w", err)
+	}
+
+	return nil
 }
 
 // getObjectTypeNumber returns the numeric type for git objects
@@ -528,47 +387,53 @@ func (gp *GitPush) Push(objStore *objects.ObjectStore) error {
 		return fmt.Errorf("reference discovery failed: %s", resp.Status)
 	}
 
-	// Parse references
-	scanner := bufio.NewScanner(resp.Body)
-	var serverRefs = make(map[string]string)
-
-	// Skip the first line (service advertisement)
-	if scanner.Scan() {
-		line := scanner.Text()
-		if !strings.Contains(line, "git-receive-pack") {
-			return fmt.Errorf("invalid service advertisement: %s", line)
-		}
+	// Read and parse the smart HTTP response
+	respData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
 	}
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		if len(line) < 4 {
-			continue
-		}
+	// Parse the packet-line format response
+	var serverRefs = make(map[string]string)
+	reader := bytes.NewReader(respData)
+	bufReader := bufio.NewReader(reader)
 
-		// Remove packet length prefix
-		if len(line) >= 4 {
-			line = line[4:]
+	// Skip the service advertisement line
+	firstLine, err := readPktLine(bufReader)
+	if err != nil {
+		return fmt.Errorf("failed to read service line: %w", err)
+	}
+	if !strings.Contains(firstLine, "git-receive-pack") {
+		return fmt.Errorf("invalid service advertisement: %s", firstLine)
+	}
+
+	// Read capabilities line and refs
+	for {
+		line, err := readPktLine(bufReader)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("failed to read ref line: %w", err)
 		}
 
 		if line == "" {
 			break
 		}
 
-		parts := strings.SplitN(line, " ", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		hash := parts[0]
-		refAndCaps := parts[1]
-
-		if strings.Contains(refAndCaps, "\000") {
-			refCapsParts := strings.SplitN(refAndCaps, "\000", 2)
-			refName := refCapsParts[0]
-			serverRefs[refName] = hash
+		// Parse ref line: "hash refname\0capabilities" or "hash refname"
+		if strings.Contains(line, "\000") {
+			parts := strings.SplitN(line, "\000", 2)
+			refLine := parts[0]
+			refParts := strings.SplitN(refLine, " ", 2)
+			if len(refParts) == 2 {
+				serverRefs[refParts[1]] = refParts[0]
+			}
 		} else {
-			serverRefs[refAndCaps] = hash
+			refParts := strings.SplitN(line, " ", 2)
+			if len(refParts) == 2 {
+				serverRefs[refParts[1]] = refParts[0]
+			}
 		}
 	}
 
@@ -604,25 +469,37 @@ func (gp *GitPush) Push(objStore *objects.ObjectStore) error {
 
 	fmt.Printf("Objects to push: %d\n", len(objectHashes))
 
-	// Create pack file with delta compression
-	packData, err := gp.CreatePackFileWithDelta(objectHashes, objStore)
+	// Create pack file
+	packData, err := gp.CreatePackFile(objectHashes, objStore)
 	if err != nil {
 		return fmt.Errorf("failed to create pack file: %w", err)
 	}
 
 	fmt.Printf("Pack file size: %d bytes\n", len(packData))
 
-	// Prepare push request
+	os.WriteFile("mytest.pack", packData, 0644)
+
+	// Prepare push request according to Git HTTP protocol
 	pushURL := fmt.Sprintf("%s/%s/git-receive-pack", baseURL, repoPath)
 
 	var requestBody bytes.Buffer
 
 	// Write update command
-	updateCmd := fmt.Sprintf("%s %s %s\000report-status", remoteCommit, localCommit, remoteBranchRef)
-	writePktLine(&requestBody, updateCmd)
-	writePktLine(&requestBody, "") // Flush packet
+	capabilities := "report-status side-band-64k agent=mygit/0.1"
+	updateCmd := fmt.Sprintf("%s %s %s\000%s", remoteCommit, localCommit, remoteBranchRef, capabilities)
 
-	// Append pack file
+	err = writePktLine(&requestBody, updateCmd)
+	if err != nil {
+		return fmt.Errorf("failed to write update command: %w", err)
+	}
+
+	// Write flush packet to end the command section
+	err = writePktLine(&requestBody, "")
+	if err != nil {
+		return fmt.Errorf("failed to write flush packet: %w", err)
+	}
+
+	// Append pack file directly (no packet line wrapper for pack data)
 	requestBody.Write(packData)
 
 	// Send push request
@@ -632,6 +509,7 @@ func (gp *GitPush) Push(objStore *objects.ObjectStore) error {
 	}
 
 	pushReq.Header.Set("Content-Type", "application/x-git-receive-pack-request")
+	pushReq.Header.Set("Accept", "application/x-git-receive-pack-result")
 	if gp.username != "" && gp.password != "" {
 		pushReq.SetBasicAuth(gp.username, gp.password)
 	}
@@ -649,6 +527,8 @@ func (gp *GitPush) Push(objStore *objects.ObjectStore) error {
 
 	// Read response
 	respReader := bufio.NewReader(pushResp.Body)
+	success := false
+
 	for {
 		line, err := readPktLine(respReader)
 		if err != nil {
@@ -664,11 +544,18 @@ func (gp *GitPush) Push(objStore *objects.ObjectStore) error {
 
 		fmt.Printf("Server: %s\n", line)
 
-		if strings.HasPrefix(line, "ng ") {
+		if strings.HasPrefix(line, "ok ") {
+			success = true
+		} else if strings.HasPrefix(line, "ng ") {
 			return fmt.Errorf("push rejected: %s", line)
 		}
 	}
 
-	fmt.Println("Push completed successfully!")
+	if success {
+		fmt.Println("Push completed successfully!")
+	} else {
+		fmt.Println("Push completed (no explicit success confirmation)")
+	}
+
 	return nil
 }

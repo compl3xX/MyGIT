@@ -2,6 +2,7 @@ package objects
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"mygit/internal/index"
 	"path/filepath"
@@ -36,46 +37,35 @@ func (t *Tree) AddEntry(mode, name, hash string, objType ObjectType) {
 }
 
 func (t *Tree) Serialize() []byte {
-	fmt.Printf("DEBUG: Serializing tree with %d entries\n", len(t.Entries))
-
-	sort.Slice(t.Entries, func(i, j int) bool {
-		return t.Entries[i].Name < t.Entries[j].Name
-	})
-
 	var buf bytes.Buffer
 
-	for i, entry := range t.Entries {
-		fmt.Printf("DEBUG: Processing entry %d:\n", i)
-		fmt.Printf("  Mode: '%s'\n", entry.Mode)
-		fmt.Printf("  Name: '%s'\n", entry.Name)
-		fmt.Printf("  Hash: '%s' (length: %d)\n", entry.Hash, len(entry.Hash))
-		fmt.Printf("  Type: %v\n", entry.Type)
-
-		// Check hash length before processing
-		if len(entry.Hash) != 40 {
-			panic(fmt.Sprintf("INVALID HASH: Entry '%s' has hash '%s' with length %d (expected 40)",
-				entry.Name, entry.Hash, len(entry.Hash)))
-		}
-
-		// Format: <mode> <name>\0<20-byte binary hash>
-		buf.WriteString(fmt.Sprintf("%s %s\x00", entry.Mode, entry.Name))
-
-		// Convert hex hash to binary
-		hashBytes := make([]byte, 20)
-
-		for j := 0; j < 20; j++ {
-			if j*2+2 > len(entry.Hash) {
-				panic(fmt.Sprintf("Hash too short for entry '%s': trying to access position %d-%d but hash length is %d",
-					entry.Name, j*2, j*2+2, len(entry.Hash)))
-			}
-			fmt.Sscanf(entry.Hash[j*2:j*2+2], "%02x", &hashBytes[j])
-		}
-
-		buf.Write(hashBytes)
-		fmt.Printf("  Successfully processed entry '%s'\n", entry.Name)
+	validModes := map[string]bool{
+		"100644": true,
+		"100755": true,
+		"40000":  true,
 	}
 
-	fmt.Printf("DEBUG: Tree serialization complete, total size: %d bytes\n", buf.Len())
+	for _, entry := range t.Entries {
+		if !validModes[entry.Mode] {
+			panic(fmt.Sprintf("❌ INVALID MODE '%s' in entry '%s'", entry.Mode, entry.Name))
+		}
+
+		if len(entry.Hash) != 40 {
+			panic(fmt.Sprintf("❌ INVALID HASH LENGTH for %s: got %d", entry.Name, len(entry.Hash)))
+		}
+
+		buf.Write([]byte(entry.Mode))
+		buf.WriteByte(' ')
+		buf.Write([]byte(entry.Name))
+		buf.WriteByte(0)
+
+		hashBytes, err := hex.DecodeString(entry.Hash)
+		if err != nil || len(hashBytes) != 20 {
+			panic(fmt.Sprintf("❌ HASH DECODE FAILED for %s: %v", entry.Name, err))
+		}
+		buf.Write(hashBytes)
+	}
+
 	return buf.Bytes()
 }
 

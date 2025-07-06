@@ -1,6 +1,7 @@
 package objects
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"time"
@@ -27,23 +28,30 @@ func NewCommit(treeHash, message, author string, parents []string) *Commit {
 	}
 }
 func (c *Commit) Serialize() []byte {
+	var buf bytes.Buffer
 
-	var lines []string
-	lines = append(lines, fmt.Sprintf("tree %s", c.Tree))
-
+	buf.WriteString(fmt.Sprintf("tree %s\n", c.Tree))
 	for _, parent := range c.Parents {
-		lines = append(lines, fmt.Sprintf("parent %s", parent))
+		buf.WriteString(fmt.Sprintf("parent %s\n", parent))
 	}
 
-	timestamp := c.Timestamp.Unix()
-	timezone := c.Timestamp.Format("-0700")
+	// Timestamp
+	timestamp := time.Now().Unix()
+	_, offset := time.Now().Zone()
+	sign := "+"
+	if offset < 0 {
+		sign = "-"
+		offset = -offset
+	}
+	timezone := fmt.Sprintf("%s%02d%02d", sign, offset/3600, (offset%3600)/60)
 
-	lines = append(lines, fmt.Sprintf("author %s %d %s", c.Author, timestamp, timezone))
-	lines = append(lines, fmt.Sprintf("committer %s %d %s", c.Committer, timestamp, c.Message))
-	lines = append(lines, "")
-	lines = append(lines, c.Message)
+	buf.WriteString(fmt.Sprintf("author %s %d %s\n", c.Author, timestamp, timezone))
+	buf.WriteString(fmt.Sprintf("committer %s %d %s\n", c.Author, timestamp, timezone))
+	buf.WriteString("\n")
+	buf.WriteString(c.Message)
+	buf.WriteString("\n")
 
-	return []byte(strings.Join(lines, "\n"))
+	return buf.Bytes()
 }
 
 func ParseCommit(content []byte) (*Commit, error) {

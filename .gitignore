@@ -24,5 +24,6 @@ go.work.sum
 # IDE settings
 .idea/
 .vscode/
+.git/
 
 mygit.exe

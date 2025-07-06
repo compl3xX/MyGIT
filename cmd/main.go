@@ -35,6 +35,8 @@ func main() {
 		commands.Checkout(args)
 	case "show":
 		commands.Show(args)
+	case "config":
+		commands.Config(args)
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
 		os.Exit(1)
